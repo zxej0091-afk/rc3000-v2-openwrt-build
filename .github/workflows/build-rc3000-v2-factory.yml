@@ -1,0 +1,122 @@
+name: Build RC3000 V2 Factory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync unzip zlib1g-dev file wget curl libelf-dev device-tree-compiler libtool-bin
+
+      - name: Checkout H3C OpenWrt source
+        run: |
+          git init openwrt
+          cd openwrt
+          git remote add origin https://github.com/FlyFish-go/openwrt.git
+          git fetch --depth 1 origin 265b0266f443a3325a8e8bc326b717339da633c9
+          git checkout --detach FETCH_HEAD
+
+      - name: Add H3C factory tool
+        run: |
+          cd openwrt
+          mkdir -p tools/firmware-utils/patches
+          curl -fL https://raw.githubusercontent.com/kuncy7/openwrt-nss-edma/593ffa8e281c0a4ab17fd52365aecb546bfaf442/tools/firmware-utils/patches/001-add-mkh3cqca.patch -o tools/firmware-utils/patches/001-add-mkh3cqca.patch
+
+      - name: Add RC3000 V2 wireless calibration
+        run: |
+          cd openwrt
+          mkdir -p package/firmware/ipq-wifi/files
+          BASE=https://raw.githubusercontent.com/kuncy7/openwrt-nss-edma/593ffa8e281c0a4ab17fd52365aecb546bfaf442/package/firmware/ipq-wifi/files
+          curl -fL "$BASE/board-h3c_magic-rc3000-v2.ipq5018" -o package/firmware/ipq-wifi/files/board-h3c_magic-rc3000-v2.ipq5018
+          curl -fL "$BASE/board-h3c_magic-rc3000-v2.qcn6122" -o package/firmware/ipq-wifi/files/board-h3c_magic-rc3000-v2.qcn6122
+          test "$(stat -c %s package/firmware/ipq-wifi/files/board-h3c_magic-rc3000-v2.ipq5018)" = 131184
+          test "$(stat -c %s package/firmware/ipq-wifi/files/board-h3c_magic-rc3000-v2.qcn6122)" = 131184
+
+      - name: Include local wireless calibration files
+        run: |
+          cd openwrt
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("package/firmware/ipq-wifi/Makefile")
+          s = p.read_text()
+          needle = "include $(INCLUDE_DIR)/package.mk\n"
+          assert s.count(needle) == 1
+          addition = needle + """
+          define Build/Prepare
+          \t$(call Build/Prepare/Default,)
+          \t$(if $(wildcard ./files/*),$(CP) ./files/* $(PKG_BUILD_DIR)/)
+          endef
+          """
+          p.write_text(s.replace(needle, addition, 1))
+          PY
+
+      - name: Update feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure RC3000 V2
+        working-directory: openwrt
+        run: |
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq50xx=y
+          CONFIG_TARGET_MULTI_PROFILE=y
+          CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+          CONFIG_TARGET_DEVICE_qualcommax_ipq50xx_DEVICE_h3c_magic-rc3000-v2=y
+          CONFIG_ATH11K_MEM_PROFILE_256M=y
+          CONFIG_PACKAGE_ath11k-firmware-ipq5018-qcn6122=y
+          CONFIG_PACKAGE_ipq-wifi-h3c_magic-rc3000-v2=y
+          CONFIG_PACKAGE_kmod-dsa-rtl8365mb=y
+          EOF
+          make defconfig
+          grep -q '^CONFIG_TARGET_DEVICE_qualcommax_ipq50xx_DEVICE_h3c_magic-rc3000-v2=y$' .config
+          grep -q '^CONFIG_PACKAGE_ipq-wifi-h3c_magic-rc3000-v2=y$' .config
+
+      - name: Build factory tool
+        working-directory: openwrt
+        run: make tools/firmware-utils/compile -j2 V=s
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j2
+
+      - name: Compile firmware
+        working-directory: openwrt
+        run: make -j2 V=s
+
+      - name: Verify factory image
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          OUT=bin/targets/qualcommax/ipq50xx
+          mapfile -t images < <(find "$OUT" -maxdepth 1 -name '*factory-rc3000.bin')
+          test "${#images[@]}" -eq 1
+          IMAGE="${images[0]}"
+          test "$(stat -c %s "$IMAGE")" -gt 160
+          HEADER=$(od -An -tc -N6 "$IMAGE" | tr -d ' \n')
+          test "$HEADER" = "H3C_+k"
+          dd if="$IMAGE" of=/tmp/factory.itb bs=1 skip=160 status=none
+          staging_dir/host/bin/mkimage -l /tmp/factory.itb
+          sha256sum "$IMAGE" | tee "$OUT/rc3000-v2-factory.sha256"
+
+      - name: Upload factory candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: RC3000-V2-Factory-Candidate
+          path: |
+            openwrt/bin/targets/qualcommax/ipq50xx/*factory-rc3000.bin
+            openwrt/bin/targets/qualcommax/ipq50xx/rc3000-v2-factory.sha256
+            openwrt/bin/targets/qualcommax/ipq50xx/config.buildinfo
+          if-no-files-found: error
+          retention-days: 7
